@@ -1,0 +1,66 @@
+name: Contracts CI
+
+on:
+    pull_request:
+        branches: [main, develop]
+    push:
+        branches: [main, develop]
+
+jobs:
+    forge-build-and-test:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  submodules: recursive
+
+            - name: Install Foundry
+              uses: foundry-rs/foundry-toolchain@v1
+              with:
+                  version: nightly
+
+            - name: Display Foundry version
+              run: |
+                  forge --version
+                  cast --version
+
+            - name: Build contracts
+              run: forge build --sizes
+
+            - name: Run tests
+              run: forge test -vvv
+
+            - name: Generate gas report
+              run: forge test --gas-report
+              continue-on-error: true
+
+            - name: Run static analysis
+              run: forge build --extra-output storageLayout
+              continue-on-error: true
+
+    code-coverage:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  submodules: recursive
+
+            - name: Install Foundry
+              uses: foundry-rs/foundry-toolchain@v1
+              with:
+                  version: nightly
+
+            - name: Generate coverage report
+              run: forge coverage --report lcov
+              continue-on-error: true
+
+            - name: Upload coverage to Codecov
+              uses: codecov/codecov-action@v3
+              with:
+                  files: ./lcov.info
+                  flags: solidity
+              continue-on-error: true
