@@ -49,6 +49,11 @@ contract YieldSaveVault is ReentrancyGuard {
         feeRate = feeRate_;
     }
 
+    /// @notice Deposits USDC into the vault and mints internal shares for the sender.
+    /// @dev Frontend flow must request a prior ERC20 approval from the user before calling this function:
+    /// user calls `USDC.approve(address(this), amount)` first, then calls `deposit(amount)`.
+    /// The vault cannot approve on behalf of the user; `_safeTransferFrom` will revert unless this
+    /// contract already has sufficient allowance to pull `amount` of USDC from `msg.sender`.
     function deposit(uint256 amount) external nonReentrant returns (uint256 shares) {
         if (amount == 0) revert ZeroAmount();
 
