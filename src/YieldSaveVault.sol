@@ -71,6 +71,11 @@ contract YieldSaveVault is ReentrancyGuard {
         emit Deposited(msg.sender, amount, shares);
     }
 
+    /// @notice Burns `shares` from the caller and returns the net USDC payout after any yield fee.
+    /// @dev UI flow should use `previewWithdraw` or `previewWithdrawFor` before submit for an optimistic quote,
+    /// then sync from this function's return value or the `Withdrawn` event once the transaction confirms.
+    /// The preview and execution share the same fee logic, but the final payout can still move if vault assets
+    /// change between the preview read and mined withdrawal transaction.
     function withdraw(uint256 shares) external nonReentrant returns (uint256 payout) {
         if (shares == 0) revert ZeroAmount();
 
@@ -106,15 +111,26 @@ contract YieldSaveVault is ReentrancyGuard {
         return payout;
     }
 
+    /// @notice Quotes how many vault shares would be minted for `amount` of USDC at the current vault ratio.
+    /// @dev Intended for pre-transaction UI state only. The frontend should refresh this quote when balances or
+    /// vault assets move, and treat the actual `Deposited` event as the source of truth after confirmation.
     function previewDeposit(uint256 amount) external view returns (uint256) {
         return _previewDeposit(amount, _totalAssets());
     }
 
+    /// @notice Quotes the caller's net USDC payout for redeeming `shares` right now.
+    /// @dev This is the UI-facing preview for the connected wallet and already excludes the fee charged on yield.
+    /// It returns `0` for invalid requests instead of reverting, which makes it safe to poll while the user edits
+    /// input. Because assets can change before the withdraw transaction is mined, the UI must resync from the
+    /// transaction result or `Withdrawn` event after confirmation.
     function previewWithdraw(uint256 shares) external view returns (uint256) {
         (uint256 payout,,) = _previewWithdrawForUser(msg.sender, shares);
         return payout;
     }
 
+    /// @notice Quotes a specific user's withdraw result, including net payout, gross assets, and fee.
+    /// @dev Useful for admin dashboards or richer UI state where the frontend needs to show the fee breakdown in
+    /// addition to the final payout. As with `previewWithdraw`, this is a point-in-time quote and not a guarantee.
     function previewWithdrawFor(address user, uint256 shares)
         external
         view
@@ -157,6 +173,7 @@ contract YieldSaveVault is ReentrancyGuard {
         fee = yld * feeRate / BPS_DENOMINATOR;
     }
 
+    // get the vault total assets (that is the USDC and the accrued yield)
     function _totalAssets() internal view returns (uint256) {
         return aUsdc.balanceOf(address(this));
     }
