@@ -3,3 +3,5 @@ out/
 .env
 .env.local
 .env.*.local
+deployments/
+broadcast/
