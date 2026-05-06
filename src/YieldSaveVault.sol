@@ -4,21 +4,12 @@ pragma solidity ^0.8.30;
 import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
 import {IERC20} from "./interfaces/IERC20.sol";
-import {IPool} from "./interfaces/IPool.sol";
+import {YieldSaveVaultStorage} from "./base/YieldSaveVaultStorage.sol";
+import {ERC20TransferLib} from "./libraries/ERC20TransferLib.sol";
+import {YieldSaveVaultAccounting} from "./base/YieldSaveVaultAccounting.sol";
 
-contract YieldSaveVault is ReentrancyGuard {
-    uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_FEE_BPS = 1_000;
-
-    IERC20 public immutable usdc;
-    IERC20 public immutable aUsdc;
-    IPool public immutable aavePool;
-    address public immutable treasury;
-    uint256 public immutable feeRate;
-
-    uint256 public totalShares;
-    mapping(address => uint256) public userShares;
-    mapping(address => uint256) public userDeposits;
+contract YieldSaveVault is ReentrancyGuard, YieldSaveVaultAccounting {
+    using ERC20TransferLib for IERC20;
 
     error ZeroAddress();
     error ZeroAmount();
@@ -36,17 +27,13 @@ contract YieldSaveVault is ReentrancyGuard {
         uint256 payout
     );
 
-    constructor(address usdc_, address aUsdc_, address aavePool_, address treasury_, uint256 feeRate_) {
+    constructor(address usdc_, address aUsdc_, address aavePool_, address treasury_, uint256 feeRate_)
+        YieldSaveVaultStorage(usdc_, aUsdc_, aavePool_, treasury_, feeRate_)
+    {
         if (usdc_ == address(0) || aUsdc_ == address(0) || aavePool_ == address(0) || treasury_ == address(0)) {
             revert ZeroAddress();
         }
         if (feeRate_ > MAX_FEE_BPS) revert InvalidFeeRate();
-
-        usdc = IERC20(usdc_);
-        aUsdc = IERC20(aUsdc_);
-        aavePool = IPool(aavePool_);
-        treasury = treasury_;
-        feeRate = feeRate_;
     }
 
     /// @notice Deposits USDC into the vault and mints internal shares for the sender.
@@ -139,63 +126,15 @@ contract YieldSaveVault is ReentrancyGuard {
         (payout, grossAssets, fee) = _previewWithdrawForUser(user, shares);
     }
 
-    function _previewWithdrawForUser(address user, uint256 shares)
-        internal
-        view
-        returns (uint256 payout, uint256 grossAssets, uint256 fee)
-    {
-        uint256 userShareBalance = userShares[user];
-        if (shares == 0 || userShareBalance == 0 || shares > userShareBalance) {
-            return (0, 0, 0);
-        }
-
-        (grossAssets,, fee) = _quoteWithdraw(user, shares, _totalAssets(), totalShares, userShareBalance);
-        payout = grossAssets - fee;
-    }
-
-    function _previewDeposit(uint256 amount, uint256 assetsBefore) internal view returns (uint256) {
-        if (amount == 0) return 0;
-        if (totalShares == 0 || assetsBefore == 0) return amount;
-        return amount * totalShares / assetsBefore;
-    }
-
-    function _quoteWithdraw(
-        address user,
-        uint256 shares,
-        uint256 assets,
-        uint256 currentTotalShares,
-        uint256 userShareBalance
-    ) internal view returns (uint256 grossAssets, uint256 principalPortion, uint256 fee) {
-        grossAssets = shares * assets / currentTotalShares;
-        principalPortion = userDeposits[user] * shares / userShareBalance;
-
-        uint256 yld = grossAssets > principalPortion ? grossAssets - principalPortion : 0;
-        fee = yld * feeRate / BPS_DENOMINATOR;
-    }
-
-    // get the vault total assets (that is the USDC and the accrued yield)
-    function _totalAssets() internal view returns (uint256) {
-        return aUsdc.balanceOf(address(this));
-    }
-
     function _safeTransfer(IERC20 token, address to, uint256 amount) internal {
-        (bool success, bytes memory data) =
-            address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+        if (!token.safeTransfer(to, amount)) revert ERC20CallFailed();
     }
 
     function _safeTransferFrom(IERC20 token, address from, address to, uint256 amount) internal {
-        (bool success, bytes memory data) =
-            address(token).call(abi.encodeCall(IERC20.transferFrom, (from, to, amount)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+        if (!token.safeTransferFrom(from, to, amount)) revert ERC20CallFailed();
     }
 
     function _forceApprove(IERC20 token, address spender, uint256 amount) internal {
-        (bool success, bytes memory data) =
-            address(token).call(abi.encodeCall(IERC20.approve, (spender, 0)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
-
-        (success, data) = address(token).call(abi.encodeCall(IERC20.approve, (spender, amount)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+        if (!token.forceApprove(spender, amount)) revert ERC20CallFailed();
     }
 }
