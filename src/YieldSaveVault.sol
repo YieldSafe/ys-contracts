@@ -4,21 +4,12 @@ pragma solidity ^0.8.30;
 import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
 import {IERC20} from "./interfaces/IERC20.sol";
-import {IPool} from "./interfaces/IPool.sol";
+import {YieldSaveVaultStorage} from "./base/YieldSaveVaultStorage.sol";
+import {ERC20TransferLib} from "./libraries/ERC20TransferLib.sol";
+import {YieldSaveVaultAccounting} from "./base/YieldSaveVaultAccounting.sol";
 
-contract YieldSaveVault is ReentrancyGuard {
-    uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_FEE_BPS = 1_000;
-
-    IERC20 public immutable usdc;
-    IERC20 public immutable aUsdc;
-    IPool public immutable aavePool;
-    address public immutable treasury;
-    uint256 public immutable feeRate;
-
-    uint256 public totalShares;
-    mapping(address => uint256) public userShares;
-    mapping(address => uint256) public userDeposits;
+contract YieldSaveVault is ReentrancyGuard, YieldSaveVaultAccounting {
+    using ERC20TransferLib for IERC20;
 
     error ZeroAddress();
     error ZeroAmount();
@@ -36,19 +27,20 @@ contract YieldSaveVault is ReentrancyGuard {
         uint256 payout
     );
 
-    constructor(address usdc_, address aUsdc_, address aavePool_, address treasury_, uint256 feeRate_) {
+    constructor(address usdc_, address aUsdc_, address aavePool_, address treasury_, uint256 feeRate_)
+        YieldSaveVaultStorage(usdc_, aUsdc_, aavePool_, treasury_, feeRate_)
+    {
         if (usdc_ == address(0) || aUsdc_ == address(0) || aavePool_ == address(0) || treasury_ == address(0)) {
             revert ZeroAddress();
         }
         if (feeRate_ > MAX_FEE_BPS) revert InvalidFeeRate();
-
-        usdc = IERC20(usdc_);
-        aUsdc = IERC20(aUsdc_);
-        aavePool = IPool(aavePool_);
-        treasury = treasury_;
-        feeRate = feeRate_;
     }
 
+    /// @notice Deposits USDC into the vault and mints internal shares for the sender.
+    /// @dev Frontend flow must request a prior ERC20 approval from the user before calling this function:
+    /// user calls `USDC.approve(address(this), amount)` first, then calls `deposit(amount)`.
+    /// The vault cannot approve on behalf of the user; `_safeTransferFrom` will revert unless this
+    /// contract already has sufficient allowance to pull `amount` of USDC from `msg.sender`.
     function deposit(uint256 amount) external nonReentrant returns (uint256 shares) {
         if (amount == 0) revert ZeroAmount();
 
@@ -66,6 +58,11 @@ contract YieldSaveVault is ReentrancyGuard {
         emit Deposited(msg.sender, amount, shares);
     }
 
+    /// @notice Burns `shares` from the caller and returns the net USDC payout after any yield fee.
+    /// @dev UI flow should use `previewWithdraw` or `previewWithdrawFor` before submit for an optimistic quote,
+    /// then sync from this function's return value or the `Withdrawn` event once the transaction confirms.
+    /// The preview and execution share the same fee logic, but the final payout can still move if vault assets
+    /// change between the preview read and mined withdrawal transaction.
     function withdraw(uint256 shares) external nonReentrant returns (uint256 payout) {
         if (shares == 0) revert ZeroAmount();
 
@@ -101,15 +98,26 @@ contract YieldSaveVault is ReentrancyGuard {
         return payout;
     }
 
+    /// @notice Quotes how many vault shares would be minted for `amount` of USDC at the current vault ratio.
+    /// @dev Intended for pre-transaction UI state only. The frontend should refresh this quote when balances or
+    /// vault assets move, and treat the actual `Deposited` event as the source of truth after confirmation.
     function previewDeposit(uint256 amount) external view returns (uint256) {
         return _previewDeposit(amount, _totalAssets());
     }
 
+    /// @notice Quotes the caller's net USDC payout for redeeming `shares` right now.
+    /// @dev This is the UI-facing preview for the connected wallet and already excludes the fee charged on yield.
+    /// It returns `0` for invalid requests instead of reverting, which makes it safe to poll while the user edits
+    /// input. Because assets can change before the withdraw transaction is mined, the UI must resync from the
+    /// transaction result or `Withdrawn` event after confirmation.
     function previewWithdraw(uint256 shares) external view returns (uint256) {
         (uint256 payout,,) = _previewWithdrawForUser(msg.sender, shares);
         return payout;
     }
 
+    /// @notice Quotes a specific user's withdraw result, including net payout, gross assets, and fee.
+    /// @dev Useful for admin dashboards or richer UI state where the frontend needs to show the fee breakdown in
+    /// addition to the final payout. As with `previewWithdraw`, this is a point-in-time quote and not a guarantee.
     function previewWithdrawFor(address user, uint256 shares)
         external
         view
@@ -118,62 +126,15 @@ contract YieldSaveVault is ReentrancyGuard {
         (payout, grossAssets, fee) = _previewWithdrawForUser(user, shares);
     }
 
-    function _previewWithdrawForUser(address user, uint256 shares)
-        internal
-        view
-        returns (uint256 payout, uint256 grossAssets, uint256 fee)
-    {
-        uint256 userShareBalance = userShares[user];
-        if (shares == 0 || userShareBalance == 0 || shares > userShareBalance) {
-            return (0, 0, 0);
-        }
-
-        (grossAssets,, fee) = _quoteWithdraw(user, shares, _totalAssets(), totalShares, userShareBalance);
-        payout = grossAssets - fee;
-    }
-
-    function _previewDeposit(uint256 amount, uint256 assetsBefore) internal view returns (uint256) {
-        if (amount == 0) return 0;
-        if (totalShares == 0 || assetsBefore == 0) return amount;
-        return amount * totalShares / assetsBefore;
-    }
-
-    function _quoteWithdraw(
-        address user,
-        uint256 shares,
-        uint256 assets,
-        uint256 currentTotalShares,
-        uint256 userShareBalance
-    ) internal view returns (uint256 grossAssets, uint256 principalPortion, uint256 fee) {
-        grossAssets = shares * assets / currentTotalShares;
-        principalPortion = userDeposits[user] * shares / userShareBalance;
-
-        uint256 yld = grossAssets > principalPortion ? grossAssets - principalPortion : 0;
-        fee = yld * feeRate / BPS_DENOMINATOR;
-    }
-
-    function _totalAssets() internal view returns (uint256) {
-        return aUsdc.balanceOf(address(this));
-    }
-
     function _safeTransfer(IERC20 token, address to, uint256 amount) internal {
-        (bool success, bytes memory data) =
-            address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+        if (!token.safeTransfer(to, amount)) revert ERC20CallFailed();
     }
 
     function _safeTransferFrom(IERC20 token, address from, address to, uint256 amount) internal {
-        (bool success, bytes memory data) =
-            address(token).call(abi.encodeCall(IERC20.transferFrom, (from, to, amount)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+        if (!token.safeTransferFrom(from, to, amount)) revert ERC20CallFailed();
     }
 
     function _forceApprove(IERC20 token, address spender, uint256 amount) internal {
-        (bool success, bytes memory data) =
-            address(token).call(abi.encodeCall(IERC20.approve, (spender, 0)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
-
-        (success, data) = address(token).call(abi.encodeCall(IERC20.approve, (spender, amount)));
-        if (!success || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+        if (!token.forceApprove(spender, amount)) revert ERC20CallFailed();
     }
 }
